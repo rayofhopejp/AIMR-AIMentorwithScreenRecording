@@ -27,6 +27,8 @@ python web_gui_fixed.py
 3. 「監視開始」ボタンをクリック
 4. AIが画面を分析して音声でアドバイスを提供
 
+※ AWS認証情報は `~/.aws_screen_monitor_config.json` に保存され、次回起動時に自動的に読み込まれます
+
 ## 必要なAWS権限
 
 - bedrock:InvokeModel

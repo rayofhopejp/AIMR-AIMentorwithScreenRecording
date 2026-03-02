@@ -1,3 +1,5 @@
 boto3>=1.34.0
 pyautogui>=0.9.54
 Pillow>=10.0.0
+pyaudio>=0.2.11
+amazon-transcribe>=0.6.2

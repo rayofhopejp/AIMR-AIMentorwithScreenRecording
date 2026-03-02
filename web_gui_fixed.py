@@ -12,14 +12,23 @@ import webbrowser
 from pathlib import Path
 import subprocess
 import platform
+import pyaudio
+import wave
+import asyncio
 
 class WebGUI:
     def __init__(self):
         self.monitoring = False
         self.bedrock_client = None
         self.polly_client = None
+        self.aws_access_key = None
+        self.aws_secret_key = None
+        self.aws_region = None
         self.interval = 1
         self.config_file = Path.home() / '.aws_screen_monitor_config.json'
+        self.transcription_text = ""
+        self.recording = False
+        self.audio_frames = []
     
     def load_config(self):
         if self.config_file.exists():
@@ -55,10 +64,14 @@ class WebGUI:
             
             self.bedrock_client = session.client('bedrock-runtime')
             self.polly_client = session.client('polly')
+            self.aws_access_key = config['accessKey']
+            self.aws_secret_key = config['secretKey']
+            self.aws_region = config['region']
             self.interval = int(config['interval'])
             
             self.monitoring = True
             threading.Thread(target=self.monitor_loop, daemon=True).start()
+            threading.Thread(target=self.record_audio_loop, daemon=True).start()
             
             return {"success": True}
         except Exception as e:
@@ -66,17 +79,114 @@ class WebGUI:
     
     def stop_monitoring(self):
         self.monitoring = False
+        self.recording = False
         return {"success": True}
+    
+    def record_audio_loop(self):
+        """音声を録音し続けるループ"""
+        CHUNK = 1024
+        FORMAT = pyaudio.paInt16
+        CHANNELS = 1
+        RATE = 16000
+        
+        p = pyaudio.PyAudio()
+        stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
+        
+        self.recording = True
+        self.audio_frames = []
+        
+        while self.monitoring:
+            try:
+                data = stream.read(CHUNK, exception_on_overflow=False)
+                self.audio_frames.append(data)
+            except:
+                pass
+        
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
+    
+    def get_transcription(self):
+        """録音した音声を文字起こし"""
+        if not self.audio_frames:
+            return ""
+        
+        try:
+            # AWS認証情報を環境変数に設定
+            os.environ['AWS_ACCESS_KEY_ID'] = self.aws_access_key
+            os.environ['AWS_SECRET_ACCESS_KEY'] = self.aws_secret_key
+            os.environ['AWS_DEFAULT_REGION'] = self.aws_region
+            
+            from amazon_transcribe.client import TranscribeStreamingClient
+            from amazon_transcribe.handlers import TranscriptResultStreamHandler
+            from amazon_transcribe.model import TranscriptEvent
+            
+            # PCMデータを取得
+            pcm_data = b''.join(self.audio_frames)
+            transcript_text = ""
+            
+            class MyEventHandler(TranscriptResultStreamHandler):
+                def __init__(self, transcript_result_stream):
+                    super().__init__(transcript_result_stream)
+                    self.transcript = ""
+                
+                async def handle_transcript_event(self, transcript_event: TranscriptEvent):
+                    results = transcript_event.transcript.results
+                    for result in results:
+                        if not result.is_partial:
+                            for alt in result.alternatives:
+                                self.transcript += alt.transcript
+            
+            async def transcribe():
+                client = TranscribeStreamingClient(region=self.aws_region)
+                stream = await client.start_stream_transcription(
+                    language_code="ja-JP",
+                    media_sample_rate_hz=16000,
+                    media_encoding="pcm",
+                )
+                
+                handler = MyEventHandler(stream.output_stream)
+                
+                async def write_chunks():
+                    chunk_size = 1024 * 8
+                    for i in range(0, len(pcm_data), chunk_size):
+                        chunk = pcm_data[i:i + chunk_size]
+                        await stream.input_stream.send_audio_event(audio_chunk=chunk)
+                        await asyncio.sleep(0.01)
+                    await stream.input_stream.end_stream()
+                
+                await asyncio.gather(write_chunks(), handler.handle_events())
+                return handler.transcript
+            
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            transcript_text = loop.run_until_complete(transcribe())
+            loop.close()
+            
+            self.audio_frames = []
+            return transcript_text
+            
+        except Exception as e:
+            print(f"文字起こしエラー: {e}")
+            return ""
     
     def monitor_loop(self):
         interval = self.interval
         
         while self.monitoring:
             try:
+                # 文字起こし取得
+                transcription = self.get_transcription()
+                
                 screenshot = pyautogui.screenshot()
                 buffer = io.BytesIO()
                 screenshot.save(buffer, format='PNG')
                 img_data = base64.b64encode(buffer.getvalue()).decode()
+                
+                # プロンプト作成
+                prompt = "あなたはAWSのシニアソリューションアーキテクトです。部下の作業している画面が転送されてきます。画面を見て50文字以内で親しみやすい日本語アドバイスをください。"
+                if transcription:
+                    prompt += f"\n\n【音声文字起こし】\n{transcription}"
                 
                 response = self.bedrock_client.invoke_model(
                     modelId='global.anthropic.claude-sonnet-4-5-20250929-v1:0',
@@ -86,12 +196,13 @@ class WebGUI:
                         "messages": [{
                             "role": "user",
                             "content": [
-                                {"type": "text", "text": "あなたはAWSのシニアソリューションアーキテクトです。部下の作業している画面が転送されてきます。画面を見て50文字以内で親しみやすい日本語アドバイスをください。"},
+                                {"type": "text", "text": prompt},
                                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_data}}
                             ]
                         }]
                     })
                 )
+                print(prompt)
                 
                 result = json.loads(response['body'].read())
                 advice = result['content'][0]['text']
